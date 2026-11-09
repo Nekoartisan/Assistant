@@ -34,7 +34,12 @@ export function oauthStart() {
   }).toString();
   return { url: url.toString(), state };
 }
-async function tokenRequest(data: Record<string, string>) {
+function readSignal(stopAt: number, cap: number) {
+  const remaining = Math.floor(stopAt - Date.now());
+  if (remaining <= 0) throw new Error("Time budget reached before Google request.");
+  return AbortSignal.timeout(Math.min(cap, remaining));
+}
+async function tokenRequest(data: Record<string, string>, stopAt?: number) {
   const r = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     body: new URLSearchParams({
@@ -42,7 +47,7 @@ async function tokenRequest(data: Record<string, string>) {
       client_id: process.env.GOOGLE_CLIENT_ID || "",
       client_secret: process.env.GOOGLE_CLIENT_SECRET || "",
     }),
-    signal: AbortSignal.timeout(12000),
+    signal: readSignal(stopAt ?? Date.now() + 12000, stopAt === undefined ? 12000 : 4000),
   });
   if (!r.ok)
     throw new Error(
@@ -89,16 +94,16 @@ export async function oauthFinish(code: string, nonce: string, cookie: string) {
   await db()`insert into accounts(email,refresh_token) values(${email},${encrypt(t.refresh_token)}) on conflict(email) do update set refresh_token=excluded.refresh_token,gap=null`;
   return email;
 }
-export async function googleAccess(encrypted: string) {
+export async function googleAccess(encrypted: string, stopAt = Date.now() + 12000) {
   const t = await tokenRequest({
     grant_type: "refresh_token",
     refresh_token: decrypt(encrypted),
-  });
+  }, stopAt);
   if (typeof t.access_token !== "string")
     throw new Error("Google access token unavailable");
   return t.access_token as string;
 }
-export async function googleGet<T>(url: string, token: string): Promise<T> {
+export async function googleGet<T>(url: string, token: string, stopAt = Date.now() + 12000): Promise<T> {
   const u = new URL(url);
   if (
     u.protocol !== "https:" ||
@@ -107,7 +112,7 @@ export async function googleGet<T>(url: string, token: string): Promise<T> {
     throw new Error("Invalid Google API host");
   const r = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(12000),
+    signal: readSignal(stopAt, 4000),
   });
   if (!r.ok) {
     const e = new Error(`Google read failed (${r.status})`) as Error & {

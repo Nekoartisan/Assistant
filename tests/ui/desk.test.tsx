@@ -2,6 +2,7 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -39,6 +40,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -76,6 +78,530 @@ function connected() {
 }
 
 describe("private desk setup", () => {
+  it("refreshes an active server sync using GET only and unlocks an expired first sync without claiming success", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let active = true;
+    responder = (url, init) =>
+      url === "/api/status"
+        ? {
+            ...(initial(url, init) as object),
+            syncInProgress: active,
+            syncLeaseExpiresAt: new Date(
+              Date.now() + (active ? 180000 : -1000),
+            ).toISOString(),
+          }
+        : url.startsWith("/api/dashboard")
+          ? {
+              items: active ? [] : [item],
+              news: [],
+              gaps: active ? ["Backfill pending."] : [],
+              lastSyncAt: null,
+            }
+          : initial(url, init);
+    await act(async () => {
+      render(<Desk />);
+    });
+    expect(screen.getByRole("button", { name: "Syncing…" })).toBeDisabled();
+    expect(screen.getByText(/Sync in progress/)).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(requests.filter((r) => r.url === "/api/status")).toHaveLength(2);
+    active = false;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByText(item.title)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No completed sync was recorded.*retry/i),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sync sources" })).toBeEnabled();
+    const count = requests.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(requests).toHaveLength(count);
+    expect(
+      requests.every((r) => !r.init?.method || r.init.method === "GET"),
+    ).toBe(true);
+  });
+  it("keeps an unconfirmed sync honest and pauses when its fresh status GET fails", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let checks = 0;
+    responder = (url, init) => {
+      if (url === "/api/sync")
+        return {
+          ok: false,
+          summary: "A sync is already in progress.",
+          gaps: [],
+        };
+      if (url === "/api/status" && checks++ > 0)
+        throw new Error("Status unavailable");
+      return initial(url, init);
+    };
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sync sources" }));
+    });
+    expect(screen.getByText(/Waiting for sync status/)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Status unavailable");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(requests.filter((r) => r.url === "/api/status")).toHaveLength(2);
+  });
+  it("checks fresh status after an already-running response and allows retry when no lease remains", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    responder = (url, init) =>
+      url === "/api/sync"
+        ? { ok: false, summary: "A sync is already in progress.", gaps: [] }
+        : initial(url, init);
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sync sources" }));
+    });
+    expect(screen.getByRole("button", { name: "Sync sources" })).toBeEnabled();
+    expect(
+      screen.getByText(/No completed sync was recorded.*retry/i),
+    ).toBeInTheDocument();
+    expect(requests.filter((r) => r.url === "/api/status")).toHaveLength(2);
+  });
+  it("stops failed refreshes, preserves the error and existing agenda, and unlocks at lease expiry", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    const expiry = new Date(Date.now() + 15000).toISOString();
+    let fail = false;
+    responder = (url, init) => {
+      if (url === "/api/status") {
+        if (fail) throw new Error("Status unavailable");
+        return {
+          ...(initial(url, init) as object),
+          syncInProgress: true,
+          syncLeaseExpiresAt: expiry,
+        };
+      }
+      return initial(url, init);
+    };
+    await act(async () => {
+      render(<Desk />);
+    });
+    fail = true;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Status unavailable");
+    expect(screen.getByText(item.title)).toBeInTheDocument();
+    const count = requests.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(requests).toHaveLength(count);
+    expect(screen.getByRole("alert")).toHaveTextContent("Status unavailable");
+    expect(screen.getByRole("button", { name: "Sync sources" })).toBeEnabled();
+    expect(screen.getByText(/lease expired.*unconfirmed/i)).toBeInTheDocument();
+  });
+  it("reports a hung GET timeout rather than silently leaving automatic refresh pending", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let checks = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        if (url === "/api/status" && checks++ > 0)
+          return new Promise<Response>(() => {});
+        return Response.json(
+          url === "/api/status"
+            ? {
+                ...(initial(url, init) as object),
+                syncInProgress: true,
+                syncLeaseExpiresAt: new Date(Date.now() + 180000).toISOString(),
+              }
+            : initial(url, init),
+        );
+      }),
+    );
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(13000);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/refresh.*timed out/i);
+    const count = requests.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(requests).toHaveLength(count);
+    expect(
+      requests.find((r) => r.url === "/api/status" && r !== requests[0])?.init
+        ?.signal?.aborted,
+    ).toBe(true);
+  });
+  it("polls an already-running sync without resubmitting POST and renders real progress before completion", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let active = false;
+    let finished = false;
+    let progress = false;
+    responder = (url, init) => {
+      if (url === "/api/sync") {
+        active = true;
+        return {
+          ok: false,
+          summary: "A sync is already in progress.",
+          gaps: [],
+        };
+      }
+      if (url === "/api/status")
+        return {
+          ...(initial(url, init) as object),
+          syncInProgress: active,
+          syncLeaseExpiresAt: active
+            ? new Date(Date.now() + 180000).toISOString()
+            : null,
+          lastSyncAt: finished ? "2026-11-09T00:00:00Z" : null,
+        };
+      if (url.startsWith("/api/dashboard"))
+        return {
+          items: progress ? [item] : [],
+          news: [],
+          gaps: progress ? ["Mail backfill remains incomplete."] : [],
+          lastSyncAt: finished ? "2026-11-09T00:00:00Z" : null,
+        };
+      return initial(url, init);
+    };
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sync sources" }));
+    });
+    expect(screen.getByRole("button", { name: "Syncing…" })).toBeDisabled();
+    progress = true;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByText(item.title)).toBeInTheDocument();
+    expect(
+      screen.getByText("Mail backfill remains incomplete."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Last sync:/)).toHaveTextContent("Not yet synced");
+    active = false;
+    finished = true;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByRole("button", { name: "Sync sources" })).toBeEnabled();
+    expect(screen.getByText(/Last sync:/)).not.toHaveTextContent(
+      "Not yet synced",
+    );
+    expect(requests.filter((r) => r.init?.method === "POST")).toHaveLength(1);
+  });
+  it("does not overlap slow polls and discards an old window response after a window change", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let release!: (r: Response) => void;
+    let checks = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        if (url === "/api/status" && checks++ === 1)
+          return new Promise<Response>((resolve) => {
+            release = resolve;
+          });
+        return Response.json(
+          url === "/api/status"
+            ? {
+                ...(initial(url, init) as object),
+                syncInProgress: true,
+                syncLeaseExpiresAt: new Date(Date.now() + 180000).toISOString(),
+              }
+            : initial(url, init),
+        );
+      }),
+    );
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(9000);
+    });
+    expect(requests.filter((r) => r.url === "/api/status")).toHaveLength(2);
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Time window"), {
+        target: { value: "2" },
+      });
+    });
+    await act(async () => {
+      release(
+        Response.json({ ...status, authenticated: false, configured: true }),
+      );
+    });
+    expect(
+      screen.getByRole("heading", { name: "Your agenda" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Time window")).toHaveValue("2");
+    expect(
+      requests.filter((r) => r.url === "/api/dashboard?weeks=1"),
+    ).toHaveLength(1);
+  });
+  it.each(["logout", "unmount"])(
+    "cancels polling and ignores late private responses on %s",
+    async (action) => {
+      vi.useFakeTimers();
+      connected();
+      const initial = responder;
+      let locked = false;
+      let checks = 0;
+      let release!: (r: Response) => void;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit) => {
+          requests.push({ url, init });
+          if (url === "/api/auth/logout") {
+            locked = true;
+            return Response.json({ ok: true });
+          }
+          if (url === "/api/status") {
+            if (locked)
+              return Response.json({
+                ...status,
+                configured: true,
+                missing: [],
+              });
+            if (checks++ > 0)
+              return new Promise<Response>((resolve) => {
+                release = resolve;
+              });
+            return Response.json({
+              ...(initial(url, init) as object),
+              syncInProgress: true,
+              syncLeaseExpiresAt: new Date(Date.now() + 180000).toISOString(),
+            });
+          }
+          return Response.json(initial(url, init));
+        }),
+      );
+      let unmount!: () => void;
+      await act(async () => {
+        ({ unmount } = render(<Desk />));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      const pending = requests.at(-1)!;
+      if (action === "logout") {
+        fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Lock desk" }));
+        });
+      } else unmount();
+      expect(pending.init?.signal?.aborted).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+      const count = requests.length;
+      await act(async () => {
+        release(
+          Response.json({
+            ...(initial("/api/status") as object),
+            syncInProgress: true,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(30000);
+      });
+      expect(requests).toHaveLength(count);
+      expect(screen.queryByText(item.title)).not.toBeInTheDocument();
+      if (action === "logout")
+        expect(screen.getByLabelText("Owner password")).toBeInTheDocument();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+  it("unlocks when a released lease is observed even if refreshing the agenda fails", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let active = true;
+    responder = (url, init) => {
+      if (url === "/api/status")
+        return {
+          ...(initial(url, init) as object),
+          syncInProgress: active,
+          syncLeaseExpiresAt: active
+            ? new Date(Date.now() + 180000).toISOString()
+            : null,
+        };
+      if (url.startsWith("/api/dashboard") && !active)
+        throw new Error("Agenda refresh failed");
+      return initial(url, init);
+    };
+    await act(async () => {
+      render(<Desk />);
+    });
+    active = false;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Agenda refresh failed",
+    );
+    expect(screen.getByRole("button", { name: "Sync sources" })).toBeEnabled();
+    expect(screen.getByText(item.title)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No completed sync was recorded.*retry/i),
+    ).toBeInTheDocument();
+    const count = requests.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(requests).toHaveLength(count);
+  });
+  it("discards a late sync response after logout and does not leave the next session stuck syncing", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let locked = false;
+    let release!: (r: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        if (url === "/api/sync")
+          return new Promise<Response>((resolve) => {
+            release = resolve;
+          });
+        if (url === "/api/auth/logout") {
+          locked = true;
+          return Response.json({ ok: true });
+        }
+        if (url === "/api/auth/login") {
+          locked = false;
+          return Response.json({ ok: true });
+        }
+        return Response.json(
+          url === "/api/status" && locked
+            ? { ...status, configured: true, missing: [] }
+            : initial(url, init),
+        );
+      }),
+    );
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Sync sources" }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Lock desk" }));
+    });
+    const count = requests.length;
+    await act(async () => {
+      release(
+        Response.json({
+          ok: false,
+          summary: "A sync is already in progress.",
+          gaps: [],
+        }),
+      );
+    });
+    expect(requests).toHaveLength(count);
+    fireEvent.change(screen.getByLabelText("Owner password"), {
+      target: { value: "test password only" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Unlock desk" }));
+    });
+    expect(screen.getByRole("button", { name: "Sync sources" })).toBeEnabled();
+  });
+  it("does not restart automatic polling until an explicit status retry succeeds", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    let checks = 0;
+    let release!: (r: Response) => void;
+    const active = () => ({
+      ...(initial("/api/status") as object),
+      syncInProgress: true,
+      syncLeaseExpiresAt: new Date(Date.now() + 180000).toISOString(),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        if (url === "/api/status") {
+          checks++;
+          if (checks === 2) throw new Error("Status unavailable");
+          if (checks >= 3)
+            return new Promise<Response>((resolve) => {
+              release = resolve;
+            });
+          return Response.json(active());
+        }
+        return Response.json(initial(url, init));
+      }),
+    );
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(checks).toBe(3);
+    await act(async () => {
+      release(Response.json(active()));
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+  it("bounds automatic refresh even when the server keeps reporting a live lease", async () => {
+    vi.useFakeTimers();
+    connected();
+    const initial = responder;
+    const expiry = new Date(Date.now() + 3600000).toISOString();
+    responder = (url, init) =>
+      url === "/api/status"
+        ? {
+            ...(initial(url, init) as object),
+            syncInProgress: true,
+            syncLeaseExpiresAt: expiry,
+          }
+        : initial(url, init);
+    await act(async () => {
+      render(<Desk />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(180000);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Automatic refresh paused",
+    );
+    expect(requests.filter((r) => r.url === "/api/status")).toHaveLength(61);
+    const count = requests.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60000);
+    });
+    expect(requests).toHaveLength(count);
+  });
   it("returns to the login form when a dashboard request reports an expired session", async () => {
     connected();
     const initial = responder;

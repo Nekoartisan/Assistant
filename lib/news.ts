@@ -76,9 +76,11 @@ const arxivQuery = new URLSearchParams({
   search_query: 'cat:cs.AI OR cat:cs.CL OR cat:cs.LG OR cat:cs.CV OR cat:stat.ML',
   sortBy: 'submittedDate', sortOrder: 'descending', max_results: '100',
 });
-async function fetchFeed(url: string, source: string, kind: 'paper' | 'news') {
+async function fetchFeed(url: string, source: string, kind: 'paper' | 'news', stopAt: number) {
+  const remaining = Math.floor(stopAt - Date.now());
+  if (remaining <= 0) throw new Error('Feed time budget reached');
   const response = await fetch(url, {
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(Math.min(2000, remaining)),
     headers: { 'User-Agent': 'BaoAssistant/1.0 (private research desk)' },
   });
   if (!response.ok) throw new Error('Feed unavailable');
@@ -86,13 +88,13 @@ async function fetchFeed(url: string, source: string, kind: 'paper' | 'news') {
   if (!entries.length) throw new Error('No valid feed entries');
   return entries;
 }
-export async function fetchResearchFeed(): Promise<{news: News[]; gaps: string[]}> {
+export async function fetchResearchFeed(stopAt = Date.now() + 4000): Promise<{news: News[]; gaps: string[]}> {
   try {
-    const news = await fetchFeed('https://export.arxiv.org/api/query?' + arxivQuery, 'arXiv', 'paper');
+    const news = await fetchFeed('https://export.arxiv.org/api/query?' + arxivQuery, 'arXiv', 'paper', stopAt);
     return { news, gaps: [] };
   } catch {
     try {
-      const news = await fetchFeed('https://rss.arxiv.org/rss/cs.AI+cs.LG+cs.CL+cs.CV+stat.ML', 'arXiv announcements (RSS)', 'paper');
+      const news = await fetchFeed('https://rss.arxiv.org/rss/cs.AI+cs.LG+cs.CL+cs.CV+stat.ML', 'arXiv announcements (RSS)', 'paper', stopAt);
       return { news, gaps: ['arXiv API unavailable: using RSS announcement dates, not original submission dates. Feed coverage is bounded.'] };
     } catch {
       throw new Error('arXiv API and announcement feed unavailable or invalid');
@@ -112,29 +114,40 @@ const feeds = [
     url: "https://deepmind.google/blog/rss.xml",
   },
 ];
-export async function syncNews() {
+export async function syncNews(stopAt = Date.now() + 4000) {
   const gaps: string[] = [];
   let count = 0;
-  const cached = await getState<{ at: string; gaps: string[] }>("newsSync");
-  if (cached && Date.now() - Date.parse(cached.at) < 3600000)
+  let complete = true;
+  const cached = await getState<{ at: string | null; gaps: string[] }>("newsSync");
+  if (cached?.at && Date.now() - Date.parse(cached.at) < 3600000)
     return { count: 0, gaps: cached.gaps };
   for (const f of feeds) {
+    if (Date.now() >= stopAt) {
+      complete = false;
+      gaps.push('Research feeds deferred: time budget reached; stored articles remain available.');
+      break;
+    }
     try {
       const result = f.kind === 'paper'
-        ? await fetchResearchFeed()
-        : { news: await fetchFeed(f.url, f.source, f.kind), gaps: [] };
+        ? await fetchResearchFeed(stopAt)
+        : { news: await fetchFeed(f.url, f.source, f.kind, stopAt), gaps: [] };
       gaps.push(...result.gaps);
       const news = result.news;
-      for (const n of news) {
-        await db()`insert into news(id,data,published_at) values(${n.id},${db().json(n as never)},${n.publishedAt}) on conflict(id) do update set data=excluded.data,fetched_at=now()`;
-        count++;
+      const unique = [...new Map(news.map((n) => [n.id, n])).values()];
+      if (unique.length) {
+        await db()`insert into news(id,data,published_at)
+          select entry->>'id',entry,(entry->>'publishedAt')::timestamptz
+          from jsonb_array_elements(${db().json(unique as never)}) as entry
+          on conflict(id) do update set data=excluded.data,fetched_at=now()`;
+        count += unique.length;
       }
     } catch {
+      complete = false;
       gaps.push(
         `${f.source} feed unavailable or invalid; stored articles remain available.`,
       );
     }
   }
-  await setState("newsSync", { at: new Date().toISOString(), gaps });
+  await setState("newsSync", { at: complete ? new Date().toISOString() : null, status: complete ? 'completed' : 'partial', gaps });
   return { count, gaps };
 }

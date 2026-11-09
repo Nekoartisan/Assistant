@@ -1,5 +1,6 @@
 import { authenticated, validOrigin } from "./security";
 import { rateLimit } from "./db";
+import { ModelApiError } from "./llm";
 export class HttpError extends Error {
   constructor(
     public status: number,
@@ -58,6 +59,7 @@ export function endpoint<A extends unknown[]>(
     try {
       return await fn(r, ...args);
     } catch (e) {
+      if (e instanceof ModelApiError) return json({ error: e.publicMessage }, 503);
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
       if (e instanceof Error && e.name === "ZodError")
         return json({ error: "Invalid request values" }, 400);

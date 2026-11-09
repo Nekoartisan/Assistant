@@ -4,7 +4,8 @@
 
 - Next.js optimized production build: PASS.
 - TypeScript `tsc --noEmit`: PASS.
-- Vitest with disposable real PostgreSQL and `LIVE_PUBLIC_FEEDS=1`: **58 passed, 0 skipped** across 20 files.
+- Vitest with disposable real PostgreSQL and `LIVE_PUBLIC_FEEDS=1`: **86 passed, 0 skipped** across 24 files.
+- Sync regression fixes: email-first fair account turns, deadline-aware provider calls, batched research persistence, bounded lease recovery, and authenticated live-status polling are covered. Chat uses `max_completion_tokens` without unsupported forced sampling; a separate tiny non-private live request returned HTTP 200 with valid JSON.
 - Playwright against the production server and a separate empty, migrated disposable PostgreSQL database: **2 passed**. Exercised real session login/logout, anonymous-route denial, cross-origin denial, account settings, weekly/research filters, desktop/mobile layout, and no browser runtime errors. Test-only integration placeholder values were used; no private Google/model integration was called.
 - Explicit migration rerun: PASS, already applied/checksummed.
 - Production dependency audit: **0 known vulnerabilities** at verification time; this is not a guarantee against unknown vulnerabilities.
@@ -12,7 +13,7 @@
 
 ## Important limits
 
-- Not deployed. No production database, Google account authorization, paid model completion, Telegram message, or Resend email was exercised for this cloud app. Tests using provider responses are explicitly simulated integration tests, not live mail coverage.
+- The latest source changes are not deployed. No live private Google email/calendar scan, Telegram message, or Resend email was exercised for this patch. Provider-fixture tests are explicitly simulated integration tests, not live mail coverage. A tiny live model connectivity request used no private data; it does not establish successful mailbox extraction or chat against the deployed website.
 - Cloud Gmail initial coverage: last 90 days, resumable in batches, not all historical mail. Full plain/HTML mail bodies are read. PDF/image/Office attachments are flagged as unread, not parsed; attachment-only exam instructions still require manual review.
 - Stored agenda facts carry exact quotes, original date wording and source links. Missing/ambiguous year/timezone requires review. Source updates are reconciled; automatic reinstatements reopen automatically dismissed facts while explicit owner decisions are retained. Bangkok week-boundary offsets are tested.
 - The two shipped cloud cron jobs are daily digests. Frequent poll reminders require deploying the optional frequent scheduler configuration on a compatible plan or using a trusted external scheduler. Date-only facts do not acquire invented midnight deadlines.

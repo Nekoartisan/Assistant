@@ -24,6 +24,8 @@ interface DeskStatus {
   accounts: { email: string; lastSyncAt: string | null }[];
   lastSyncAt: string | null;
   gaps: string[];
+  syncInProgress?: boolean;
+  syncLeaseExpiresAt?: string | null;
 }
 interface Dashboard {
   items: Deadline[];
@@ -35,15 +37,17 @@ async function api<T>(
   url: string,
   body?: unknown,
   method = "POST",
+  signal?: AbortSignal,
 ): Promise<T> {
   const response = await fetch(
     url,
     body === undefined
-      ? { cache: "no-store" }
+      ? { cache: "no-store", signal }
       : {
           method,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
+          signal,
         },
   );
   const data = await response.json().catch(() => {
@@ -76,15 +80,42 @@ export default function Desk() {
   const [loading, setLoading] = useState(false);
   const [settings, setSettings] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [awaitingSync, setAwaitingSync] = useState(false);
+  const [pollingStopped, setPollingStopped] = useState(false);
+  const mounted = useRef(true);
+  const session = useRef(0);
+  const statusGeneration = useRef(0);
+  const pollController = useRef<AbortController | null>(null);
+  const currentWeeks = useRef(weeks);
+  currentWeeks.current = weeks;
+  const serverSyncing = !!status?.syncInProgress;
+  function invalidateSession() {
+    ++session.current;
+    ++statusGeneration.current;
+    ++generation.current;
+    pollController.current?.abort();
+    setAwaitingSync(false);
+    setSyncing(false);
+    setLoading(false);
+  }
   function reportError(error: unknown) {
+    if (!mounted.current) return;
     if ((error as { status?: number }).status === 401) {
-      ++generation.current;
+      invalidateSession();
       setDashboard(null);
       setSettings(false);
       setSyncGaps([]);
       setSyncMessage("");
       setStatus((old) =>
-        old ? { ...old, authenticated: false, accounts: [] } : old,
+        old
+          ? {
+              ...old,
+              authenticated: false,
+              accounts: [],
+              syncInProgress: false,
+              syncLeaseExpiresAt: null,
+            }
+          : old,
       );
     }
     setError(
@@ -94,11 +125,22 @@ export default function Desk() {
     );
   }
   async function logout() {
+    invalidateSession();
     setBusy(true);
     setError("");
     try {
       await api("/api/auth/logout", {});
-      ++generation.current;
+      setStatus((old) =>
+        old
+          ? {
+              ...old,
+              authenticated: false,
+              accounts: [],
+              syncInProgress: false,
+              syncLeaseExpiresAt: null,
+            }
+          : old,
+      );
       setDashboard(null);
       setSettings(false);
       setSyncMessage("");
@@ -113,7 +155,10 @@ export default function Desk() {
   const [syncMessage, setSyncMessage] = useState("");
   const [syncGaps, setSyncGaps] = useState<string[]>([]);
   async function sync() {
+    if (syncing || serverSyncing) return;
+    const owner = session.current;
     setSyncing(true);
+    setPollingStopped(false);
     setError("");
     setSyncMessage("");
     try {
@@ -122,43 +167,181 @@ export default function Desk() {
         summary: string;
         gaps: string[];
       }>("/api/sync", {});
+      if (!mounted.current || owner !== session.current) return;
       setSyncGaps(result.gaps || []);
-      await loadStatus();
+      setAwaitingSync(!result.ok);
       setSyncMessage(result.summary);
+      await loadStatus(undefined, !result.ok);
     } catch (e) {
-      reportError(e);
+      if (owner === session.current) {
+        setPollingStopped(true);
+        reportError(e);
+      }
     } finally {
-      setSyncing(false);
+      if (mounted.current && owner === session.current) setSyncing(false);
     }
   }
   const generation = useRef(0);
-  async function loadDashboard(window: number) {
+  async function loadDashboard(
+    window: number,
+    signal?: AbortSignal,
+    background = false,
+  ) {
     const request = ++generation.current;
-    setLoading(true);
-    setDashboard(null);
+    if (!background) {
+      setLoading(true);
+      setDashboard(null);
+    }
     try {
-      const data = await api<Dashboard>(`/api/dashboard?weeks=${window}`);
-      if (request === generation.current) setDashboard(data);
+      const data = await api<Dashboard>(
+        `/api/dashboard?weeks=${window}`,
+        undefined,
+        "GET",
+        signal,
+      );
+      if (mounted.current && !signal?.aborted && request === generation.current)
+        setDashboard(data);
     } finally {
-      if (request === generation.current) setLoading(false);
+      if (mounted.current && !signal?.aborted && request === generation.current)
+        setLoading(false);
     }
   }
   async function retry() {
     setError("");
     try {
       await loadStatus();
+      if (mounted.current) setPollingStopped(false);
     } catch (e) {
       reportError(e);
     }
   }
-  async function loadStatus() {
-    const next = await api<DeskStatus>("/api/status");
-    setStatus(next);
-    if (next.authenticated) await loadDashboard(weeks);
+  async function loadStatus(signal?: AbortSignal, background = false) {
+    const request = ++statusGeneration.current;
+    const owner = session.current;
+    const next = await api<DeskStatus>("/api/status", undefined, "GET", signal);
+    const current = () =>
+      mounted.current &&
+      !signal?.aborted &&
+      owner === session.current &&
+      request === statusGeneration.current;
+    if (!current()) return;
+    try {
+      if (next.authenticated)
+        await loadDashboard(currentWeeks.current, signal, background);
+    } finally {
+      // Lease observations remain useful even if the agenda GET fails.
+      if (current()) {
+        setStatus(next);
+        if (!next.authenticated) {
+          setDashboard(null);
+          setAwaitingSync(false);
+        } else if (
+          !next.syncInProgress &&
+          (background || awaitingSync || next.syncLeaseExpiresAt)
+        ) {
+          setAwaitingSync(false);
+          setSyncMessage(
+            next.lastSyncAt
+              ? "Sync is no longer active. Review source coverage and retry if needed."
+              : "No completed sync was recorded. Please retry Sync sources.",
+          );
+        }
+      }
+    }
+    if (!current()) return;
+    return next;
   }
   useEffect(() => {
-    loadStatus().catch(reportError);
+    mounted.current = true;
+    const controller = new AbortController();
+    loadStatus(controller.signal).catch((e) => {
+      if (!controller.signal.aborted) reportError(e);
+    });
+    return () => {
+      mounted.current = false;
+      ++session.current;
+      ++generation.current;
+      ++statusGeneration.current;
+      controller.abort();
+      pollController.current?.abort();
+    };
   }, []); // Initial session check; no inbox request before authentication.
+  useEffect(() => {
+    if (
+      !status?.authenticated ||
+      !status.configured ||
+      (!serverSyncing && !awaitingSync) ||
+      pollingStopped ||
+      syncing
+    )
+      return;
+    const controller = new AbortController();
+    pollController.current = controller;
+    let timer: ReturnType<typeof setTimeout>;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    async function refresh() {
+      if (controller.signal.aborted) return;
+      timeout = setTimeout(() => {
+        if (controller.signal.aborted) return;
+        controller.abort();
+        setPollingStopped(true);
+        setError(
+          "Automatic refresh timed out. Refresh status to check the sync again.",
+        );
+      }, 10000);
+      try {
+        const next = await loadStatus(controller.signal, true);
+        if (controller.signal.aborted || !next?.authenticated) return;
+        if (next.syncInProgress) {
+          if (++attempts >= 60) {
+            setPollingStopped(true);
+            setError(
+              "Automatic refresh paused. Refresh status to check the sync again.",
+            );
+          } else timer = setTimeout(refresh, 3000);
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          setPollingStopped(true);
+          reportError(e);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    timer = setTimeout(refresh, 3000);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(timeout);
+      controller.abort();
+      if (pollController.current === controller) pollController.current = null;
+    };
+  }, [
+    status?.authenticated,
+    status?.configured,
+    serverSyncing,
+    awaitingSync,
+    pollingStopped,
+    syncing,
+    weeks,
+  ]);
+  useEffect(() => {
+    if (!serverSyncing || !status?.syncLeaseExpiresAt) return;
+    const remaining = Date.parse(status.syncLeaseExpiresAt) - Date.now();
+    if (!Number.isFinite(remaining)) return;
+    const timer = setTimeout(
+      () => {
+        setStatus((old) => (old ? { ...old, syncInProgress: false } : old));
+        setAwaitingSync(false);
+        setSyncMessage(
+          "The sync lease expired. Completion is unconfirmed; please refresh status or retry Sync sources.",
+        );
+      },
+      Math.max(0, remaining),
+    );
+    return () => clearTimeout(timer);
+  }, [serverSyncing, status?.syncLeaseExpiresAt]);
   async function patchItem(id: string, patch: Partial<Deadline>) {
     setPending(id);
     setError("");
@@ -260,9 +443,9 @@ export default function Desk() {
           <div className="alert" role="alert">
             <strong>Something needs attention.</strong>
             <p>{error}</p>
-            {!status && (
+            {(!status || status.authenticated) && (
               <button className="secondary" onClick={retry}>
-                Retry connection
+                {status ? "Refresh status" : "Retry connection"}
               </button>
             )}
           </div>
@@ -436,11 +619,18 @@ export default function Desk() {
                 </label>
                 <button
                   className="primary"
-                  disabled={syncing || loading}
+                  disabled={syncing || serverSyncing || awaitingSync || loading}
                   onClick={sync}
                 >
-                  <RefreshCw size={15} className={syncing ? "spin" : ""} />
-                  {syncing ? "Syncing…" : "Sync sources"}
+                  <RefreshCw
+                    size={15}
+                    className={
+                      syncing || serverSyncing || awaitingSync ? "spin" : ""
+                    }
+                  />
+                  {syncing || serverSyncing || awaitingSync
+                    ? "Syncing…"
+                    : "Sync sources"}
                 </button>
               </div>
             </div>
@@ -451,7 +641,19 @@ export default function Desk() {
                   ? formatDate(dashboard.lastSyncAt)
                   : "Not yet synced"}
               </span>
-              {syncMessage && <p role="status">{syncMessage}</p>}
+              {serverSyncing || awaitingSync ? (
+                <p role="status">
+                  {serverSyncing
+                    ? "Sync in progress."
+                    : "Waiting for sync status."}{" "}
+                  {pollingStopped
+                    ? "Automatic refresh is paused; refresh status to check progress."
+                    : "Checking for updated sources every few seconds."}{" "}
+                  Completion has not been confirmed.
+                </p>
+              ) : (
+                syncMessage && <p role="status">{syncMessage}</p>
+              )}
             </div>
             <div className="workspace">
               <section className="monitor" aria-label="Agenda monitor">

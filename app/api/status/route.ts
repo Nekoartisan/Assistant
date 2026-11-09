@@ -15,7 +15,11 @@ export const GET = endpoint(async (r) => {
     gaps: [] as string[],
   };
   if (!auth) return json(base);
-  if (!process.env.DATABASE_URL) return json(base);
+  const sync = {
+    syncInProgress: false,
+    syncLeaseExpiresAt: null as string | null,
+  };
+  if (!process.env.DATABASE_URL) return json({ ...base, ...sync });
   try {
     const rows =
       await db()`select email,last_sync_at,gap from accounts order by email`;
@@ -26,9 +30,13 @@ export const GET = endpoint(async (r) => {
     const s = await getState<{ gaps: string[]; lastSyncAt: string }>("sync");
     base.lastSyncAt = s?.lastSyncAt || null;
     base.gaps = s?.gaps || [];
+    const leases =
+      await db()`select expires_at, expires_at > now() as active from leases where name='sync'`;
+    sync.syncInProgress = leases[0]?.active === true;
+    sync.syncLeaseExpiresAt = leases[0]?.expires_at?.toISOString() || null;
   } catch {
     base.configured = false;
     base.gaps.push("Database unavailable or migration not applied.");
   }
-  return json(base);
+  return json({ ...base, ...sync });
 });
