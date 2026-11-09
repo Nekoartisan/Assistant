@@ -3,6 +3,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { DateTime } from "luxon";
 import type { Fact } from "./extraction";
 import type { Deadline, News } from "./types";
+import { normalizeCoverageGaps } from "./coverage";
 let connection: ReturnType<typeof postgres> | undefined;
 export function db() {
   if (!connection) {
@@ -107,7 +108,7 @@ export async function dashboard(weeks: number) {
   return {
     items: items.map((r) => r.data as Deadline),
     news: news.map((r) => r.data as News),
-    gaps: [...new Set(gaps)],
+    gaps: normalizeCoverageGaps(gaps),
     lastSyncAt: state?.lastSyncAt || null,
   };
 }

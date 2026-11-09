@@ -4,9 +4,11 @@
 
 - Next.js optimized production build: PASS.
 - TypeScript `tsc --noEmit`: PASS.
-- Vitest with disposable real PostgreSQL and `LIVE_PUBLIC_FEEDS=1`: **86 passed, 0 skipped** across 24 files.
+- Vitest with disposable real PostgreSQL and `LIVE_PUBLIC_FEEDS=1`: **121 passed, 0 skipped** across 29 files.
 - Sync regression fixes: email-first fair account turns, deadline-aware provider calls, batched research persistence, bounded lease recovery, and authenticated live-status polling are covered. Chat uses `max_completion_tokens` without unsupported forced sampling; a separate tiny non-private live request returned HTTP 200 with valid JSON.
-- Playwright against the production server and a separate empty, migrated disposable PostgreSQL database: **2 passed**. Exercised real session login/logout, anonymous-route denial, cross-origin denial, account settings, weekly/research filters, desktop/mobile layout, and no browser runtime errors. Test-only integration placeholder values were used; no private Google/model integration was called.
+- Playwright against the production server and a separate empty, migrated disposable PostgreSQL database: **3 passed**. Exercised real session login/logout, anonymous-route denial, cross-origin denial, account settings, weekly/research filters, desktop/mobile layout, and no browser runtime errors. A controlled-response continuation scenario proved sequential automatic batches, minimum spacing and stop-at-caught-up behavior; it does not claim real Google sync. Test-only integration placeholder values were used; no private Google/model integration was called.
+- Throughput fixtures: **16 full threads in one cycle** with concurrency capped at four, and **100 calendar events / 200 facts in three source/item write statements**. These are controlled-provider results against real disposable PostgreSQL, not a speed promise for the user's mailbox. Failure-isolation, backoff, resumable discovery, subject-only deadlines, source-change review, and 15-minute fresh-calendar reuse were verified.
+- A separate live model test used only a synthetic exam/registration message: two facts were returned with the explicit ICT exam time and date-only registration deadline preserved. No real email was sent to the provider in that diagnostic.
 - Explicit migration rerun: PASS, already applied/checksummed.
 - Production dependency audit: **0 known vulnerabilities** at verification time; this is not a guarantee against unknown vulnerabilities.
 - Local Hermes ledger/collector Python tests: **8 passed**. Existing local morning/evening job schedules/destinations preserved; only prompts and collector script changed.

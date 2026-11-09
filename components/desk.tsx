@@ -1,6 +1,8 @@
 "use client";
 import React, { useEffect, useRef, useState } from "react";
 import Assistant from "./assistant";
+import type { SyncProgress } from "../lib/sync-progress";
+import { normalizeCoverageGaps } from "../lib/coverage";
 import {
   ArrowUpRight,
   BookOpen,
@@ -26,6 +28,7 @@ interface DeskStatus {
   gaps: string[];
   syncInProgress?: boolean;
   syncLeaseExpiresAt?: string | null;
+  progress?: SyncProgress;
 }
 interface Dashboard {
   items: Deadline[];
@@ -82,6 +85,22 @@ export default function Desk() {
   const [syncing, setSyncing] = useState(false);
   const [awaitingSync, setAwaitingSync] = useState(false);
   const [pollingStopped, setPollingStopped] = useState(false);
+  const [autoRunning, setAutoRunning] = useState(false);
+  const [autoPaused, setAutoPaused] = useState(false);
+  const [progress, setProgress] = useState<SyncProgress | undefined>();
+  type AutoRun = { active: boolean; owner: number; started: number; batches: number };
+  const autoRun = useRef<AutoRun | null>(null);
+  const autoTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const autoDeadline = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const batchInFlight = useRef(false);
+  const lastBatchStart = useRef(-Infinity);
+  function stopAuto(message?: string) {
+    if (autoRun.current) autoRun.current.active = false;
+    clearTimeout(autoTimer.current);
+    clearTimeout(autoDeadline.current);
+    setAutoRunning(false);
+    if (message) { setAutoPaused(true); setSyncMessage(message); }
+  }
   const mounted = useRef(true);
   const session = useRef(0);
   const statusGeneration = useRef(0);
@@ -90,6 +109,9 @@ export default function Desk() {
   currentWeeks.current = weeks;
   const serverSyncing = !!status?.syncInProgress;
   function invalidateSession() {
+    stopAuto();
+    setAutoPaused(false);
+    setProgress(undefined);
     ++session.current;
     ++statusGeneration.current;
     ++generation.current;
@@ -100,6 +122,7 @@ export default function Desk() {
   }
   function reportError(error: unknown) {
     if (!mounted.current) return;
+    if (autoRun.current?.active) stopAuto("Automatic sync paused after an error. Review the error before resuming.");
     if ((error as { status?: number }).status === 401) {
       invalidateSession();
       setDashboard(null);
@@ -155,30 +178,70 @@ export default function Desk() {
   const [syncMessage, setSyncMessage] = useState("");
   const [syncGaps, setSyncGaps] = useState<string[]>([]);
   async function sync() {
-    if (syncing || serverSyncing) return;
-    const owner = session.current;
-    setSyncing(true);
+    if (batchInFlight.current || serverSyncing || autoRun.current?.active) return;
+    const run: AutoRun = {active:true,owner:session.current,started:Date.now(),batches:0};
+    autoRun.current = run;
+    setAutoRunning(true);
+    setAutoPaused(false);
     setPollingStopped(false);
     setError("");
     setSyncMessage("");
+    autoDeadline.current = setTimeout(() => {
+      if (autoRun.current === run && run.active)
+        stopAuto("Automatic sync paused at the 10-minute limit. Resume to continue saved cursors.");
+    }, 600000);
+    const wait = Math.max(0, lastBatchStart.current + 5000 - Date.now());
+    if (wait) autoTimer.current = setTimeout(() => void runBatch(run), wait);
+    else await runBatch(run);
+  }
+  async function runBatch(run: AutoRun) {
+    if (!mounted.current || run.owner !== session.current || !run.active || batchInFlight.current) return;
+    if (run.batches >= 20 || Date.now() - run.started >= 600000) {
+      stopAuto("Automatic sync paused at its safety limit. Resume to continue saved cursors.");
+      return;
+    }
+    batchInFlight.current = true;
+    lastBatchStart.current = Date.now();
+    ++run.batches;
+    setSyncing(true);
     try {
       const result = await api<{
         ok: boolean;
         summary: string;
         gaps: string[];
+        progress?: SyncProgress;
       }>("/api/sync", {});
-      if (!mounted.current || owner !== session.current) return;
+      if (!mounted.current || run.owner !== session.current) return;
       setSyncGaps(result.gaps || []);
+      if (result.progress) setProgress(result.progress);
       setAwaitingSync(!result.ok);
-      setSyncMessage(result.summary);
-      await loadStatus(undefined, !result.ok);
+      if (run.active) setSyncMessage(result.summary);
+      const next = await loadStatus(undefined, !result.ok);
+      if (!mounted.current || run.owner !== session.current || !run.active) return;
+      const p = result.progress;
+      // A lease conflict is an observation, never permission to replay a POST.
+      if (!result.ok || !next?.authenticated || !next.configured || next.syncInProgress || !p || !p.hasMore) {
+        stopAuto();
+        return;
+      }
+      if (!p.canContinue || !p.madeProgress) {
+        stopAuto("Automatic sync paused: no further forward progress is available. Review failures, then Resume to retry saved cursors.");
+        return;
+      }
+      if (run.batches >= 20 || Date.now() - run.started >= 600000) {
+        stopAuto("Automatic sync paused at its safety limit. Resume to continue saved cursors.");
+        return;
+      }
+      autoTimer.current = setTimeout(() => void runBatch(run), Math.max(0, lastBatchStart.current + 5000 - Date.now()));
     } catch (e) {
-      if (owner === session.current) {
+      if (mounted.current && run.owner === session.current) {
+        stopAuto("Automatic sync paused after an error. Review the error before resuming.");
         setPollingStopped(true);
         reportError(e);
       }
     } finally {
-      if (mounted.current && owner === session.current) setSyncing(false);
+      batchInFlight.current = false;
+      if (mounted.current && run.owner === session.current) setSyncing(false);
     }
   }
   const generation = useRef(0);
@@ -232,7 +295,11 @@ export default function Desk() {
       // Lease observations remain useful even if the agenda GET fails.
       if (current()) {
         setStatus(next);
+        if (next.authenticated && next.progress) setProgress(next.progress);
         if (!next.authenticated) {
+          stopAuto();
+          setAutoPaused(false);
+          setProgress(undefined);
           setDashboard(null);
           setAwaitingSync(false);
         } else if (
@@ -259,6 +326,9 @@ export default function Desk() {
     });
     return () => {
       mounted.current = false;
+      if (autoRun.current) autoRun.current.active = false;
+      clearTimeout(autoTimer.current);
+      clearTimeout(autoDeadline.current);
       ++session.current;
       ++generation.current;
       ++statusGeneration.current;
@@ -407,9 +477,10 @@ export default function Desk() {
         b.dateOnly || b.dueAt || "9999",
       ),
     );
-  const gaps = Array.from(
-    new Set([...(status?.gaps || []), ...(dashboard?.gaps || []), ...syncGaps]),
-  );
+  const gaps = normalizeCoverageGaps([
+    ...(status?.gaps || []), ...(dashboard?.gaps || []), ...syncGaps,
+    ...(progress?.blockedReasons || []),
+  ]);
   return (
     <div className="desk-shell">
       <a href="#main" className="skip-link">
@@ -619,7 +690,7 @@ export default function Desk() {
                 </label>
                 <button
                   className="primary"
-                  disabled={syncing || serverSyncing || awaitingSync || loading}
+                  disabled={autoRunning || syncing || serverSyncing || awaitingSync || loading}
                   onClick={sync}
                 >
                   <RefreshCw
@@ -628,13 +699,23 @@ export default function Desk() {
                       syncing || serverSyncing || awaitingSync ? "spin" : ""
                     }
                   />
-                  {syncing || serverSyncing || awaitingSync
+                  {autoRunning || syncing || serverSyncing || awaitingSync
                     ? "Syncing…"
                     : "Sync sources"}
                 </button>
+                {autoRunning && <button className="secondary" onClick={() => stopAuto("Automatic sync paused. The current batch may finish; Resume continues saved cursors.")}>Pause sync</button>}
+                {autoPaused && !autoRunning && <button className="secondary" disabled={syncing || serverSyncing || awaitingSync || loading} onClick={sync}>Resume sync</button>}
               </div>
             </div>
             <div className="sync-status">
+              <p className="muted">Initial mail scope: 90-day backfill, then incremental updates. The browser must remain open for automatic batches; up to 20 batches or 10 minutes per run.</p>
+              {progress && <section aria-label="Source sync progress" aria-live="polite">
+                <p>{progress.totalProcessedThreads} threads processed · {progress.totalPendingThreads} known pending (including retries) · {progress.totalFailedThreads} failed thread{progress.totalFailedThreads === 1 ? "" : "s"} awaiting retry or review.</p>
+                {progress.accounts.map(account => <p key={account.email}>
+                  {account.email}: {account.processedThreads} processed threads; {account.pendingThreads} known pending; {account.failedThreads} failed. {account.calendarsDone} of {account.calendarsTotal} calendars completed{account.calendarComplete ? "." : " (calendar discovery/work incomplete)."} {account.hasMoreMailPages ? "More mail pages remain; the total is not yet known." : account.mailComplete ? "Mail cursor caught up in the configured scope." : "Mail coverage remains incomplete."}
+                </p>)}
+                {!progress.hasMore && <p>Saved mail and calendar cursors are caught up in the configured scope. Review coverage gaps separately.</p>}
+              </section>}
               <span>
                 Last sync:{" "}
                 {dashboard?.lastSyncAt

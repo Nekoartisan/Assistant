@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { complete } from '../../lib/llm';
+import { complete, extractThread } from '../../lib/llm';
 import { endpoint, json } from '../../lib/http';
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 it('uses reasoning-model compatible tokens and leaves unsupported sampling at its default', async () => {
@@ -27,4 +27,14 @@ it('shows a safe model-specific error instead of blaming database migrations', a
   expect(result.error).toMatch(/model.*request parameters/i);
   expect(result.error).not.toContain('private-fixture-key');
   expect(result.error).not.toContain('secret provider body');
+});
+it('identifies schema failures safely so a source can retry without hiding its blocker', async () => {
+  vi.stubEnv('OPENAI_API_KEY','fixture-only');
+  vi.stubEnv('OPENAI_MODEL','test');
+  vi.stubGlobal('fetch', async () => Response.json({choices:[{message:{content:JSON.stringify({facts:[{evidence:'PRIVATE-TEST-BODY',kind:'wrong-kind'}]})}}]}));
+  let failure: unknown;
+  try { await extractThread('PRIVATE-TEST-BODY','2026-11-09T00:00:00Z',[]); } catch (e) { failure=e; }
+  expect(failure).toMatchObject({name:'ModelExtractionError',message:expect.stringContaining('schema')});
+  expect((failure as Error).message).not.toContain('PRIVATE-TEST-BODY');
+  expect((failure as Error).message).not.toContain('fixture-only');
 });

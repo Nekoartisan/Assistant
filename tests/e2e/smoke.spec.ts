@@ -46,3 +46,28 @@ test('real login, source settings, weekly filters, mobile layout and logout', as
   expect((await page.request.get('/api/dashboard')).status()).toBe(401);
   expect(errors).toEqual([]);
 });
+
+test('controlled continuation scenario runs sequential batches and stops when scope is caught up', async ({ page }) => {
+  // UI-only provider scenario; actual owner login and server rendering, simulated sync responses.
+  const starts: number[] = [];
+  let processed = 0;
+  const progress = () => ({accounts:[{email:'fixture@example.test',processedThreads:processed,pendingThreads:processed < 2 ? 1 : 0,failedThreads:0,hasMoreMailPages:processed < 2,mailComplete:processed >= 2,calendarsDone:1,calendarsTotal:1,calendarComplete:true}],totalProcessedThreads:processed,totalPendingThreads:processed < 2 ? 1 : 0,totalFailedThreads:0,hasMore:processed < 2,canContinue:processed < 2,madeProgress:processed > 0,scopeDays:90,blockedReasons:[]});
+  await page.route('**/api/status', async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    await route.fulfill({response,json:data.authenticated ? {...data,progress:progress()} : data});
+  });
+  await page.route('**/api/sync', async route => {
+    starts.push(Date.now()); processed++;
+    await route.fulfill({json:{ok:true,summary:'Controlled test batch '+processed,gaps:[],progress:progress()}});
+  });
+  await page.goto('/');
+  await page.getByLabel('Owner password').fill(password);
+  await page.getByRole('button',{name:'Unlock desk'}).click();
+  await page.getByRole('button',{name:'Sync sources',exact:true}).click();
+  await expect.poll(() => starts.length,{timeout:12000}).toBe(2);
+  expect(starts[1]-starts[0]).toBeGreaterThanOrEqual(4900);
+  await expect(page.getByRole('button',{name:'Sync sources',exact:true})).toBeEnabled();
+  await expect(page.getByRole('button',{name:'Pause sync'})).toHaveCount(0);
+  await expect(page.getByRole('region',{name:'Source sync progress'})).toContainText('2 threads processed');
+});

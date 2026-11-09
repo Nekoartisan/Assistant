@@ -5,20 +5,20 @@ import {
   googleGet,
   gmailUrl,
   allowedEmail,
-  calendarFacts,
   type CalendarEvent,
 } from "./google";
 import {
   parseMailBody,
-  validateFacts,
   type MimePart,
   type Fact,
 } from "./extraction";
 import { extractThread } from "./llm";
 import { syncNews } from "./news";
+import { saveCalendarPage } from "./bulk-facts";
 interface Cursor {
   mailComplete?: boolean;
   mailQueue?: string[];
+  mailRetries?: Record<string, { attempts: number; nextRetryAt: string; reason: string }>;
   mailPage?: string | null;
   mailListingDone?: boolean;
   historyId?: string;
@@ -33,6 +33,7 @@ interface Cursor {
   calendarStart?: string;
   calendarEnd?: string;
   calendarComplete?: boolean;
+  calendarSyncedAt?: string;
   historyGap?: string;
   attachmentGaps?: string[];
 }
@@ -129,9 +130,15 @@ async function mailThread(
   if (!thread.messages?.length) throw new Error("Thread body unavailable");
   for (const m of thread.messages)
     await hydrate(m.payload, m.id, token, gaps, email, stopAt);
-  const body = thread.messages
-    .map((m) => parseMailBody(m.payload))
-    .join("\n\n");
+  // Keep full message bodies and quoted subject evidence in chronological order.
+  // Transport timestamps are explicitly metadata, never obligation evidence.
+  const messages = [...thread.messages].sort((a, b) => Number(a.internalDate || 0) - Number(b.internalDate || 0));
+  const body = messages.map(m => {
+    const headers = m.payload.headers || [];
+    const header = (name: string) => headers.filter(h => h.name.toLowerCase() === name.toLowerCase()).map(h => `${name}: ${h.value}`).join('\n');
+    const date = header('Date') || `Date metadata (internalDate fallback): ${m.internalDate ? new Date(Number(m.internalDate)).toISOString() : 'unavailable'}`;
+    return [`Message ID: ${m.id || 'unavailable'}`, header('Subject'), header('From'), date, 'Full body:', parseMailBody(m.payload)].filter(Boolean).join('\n');
+  }).join('\n\n--- next message ---\n\n');
   const url = gmailUrl(email, id);
   const s = await source(email, "mail", id, body, url);
   if (s.unchanged) return true;
@@ -143,10 +150,10 @@ async function mailThread(
     cancelled: r.data.status === "dismissed",
   }));
   const receivedAt = new Date(
-    Number(thread.messages.at(-1)?.internalDate || Date.now()),
+    Number(messages.at(-1)?.internalDate || Date.now()),
   ).toISOString();
   if (Date.now() >= stopAt) throw new Error("Time budget reached before mail extraction.");
-  const facts = await extractThread(body, receivedAt, previous, Math.max(1, Math.floor(Math.min(8000, stopAt - Date.now()))));
+  const facts = await extractThread(body, receivedAt, previous, Math.max(1, Math.floor(Math.min(20000, stopAt - Date.now()))));
   await saveFacts(s.id, email, url, facts);
   return true;
 }
@@ -161,8 +168,7 @@ async function enqueueMail(email: string, c: Cursor, token: string, stopAt: numb
     c.lookback = Math.floor(Date.now() / 1000) - 90 * 86400;
     await storeCursor(email, c);
   }
-  if (!c.mailComplete) {
-    if (c.mailListingDone) return;
+  if (!c.mailListingDone && !c.mailComplete) {
     const q = new URLSearchParams({
       maxResults: "10",
       includeSpamTrash: "true",
@@ -201,8 +207,11 @@ async function enqueueMail(email: string, c: Cursor, token: string, stopAt: numb
       ),
     ];
     c.historyPage = page.nextPageToken || null;
-    c.historyTarget = page.historyId;
+    if (page.historyId !== c.historyId || page.nextPageToken || c.mailQueue.length)
+      c.historyTarget = page.historyId;
   }
+  // Failed IDs stay exclusively in the durable retry lane, including history duplicates.
+  c.mailQueue = [...new Set(c.mailQueue || [])].filter(id => !c.mailRetries?.[id]);
   await storeCursor(email, c);
 }
 async function syncCalendar(
@@ -211,21 +220,18 @@ async function syncCalendar(
   token: string,
   gaps: string[],
   stopAt: number,
+  progress: (count: number) => void,
 ) {
+  // Backfill continuation must not repeatedly restart an already-fresh calendar scan.
+  const completedAt = Date.parse(c.calendarSyncedAt || '');
+  if (c.calendarComplete && Number.isFinite(completedAt) && Date.now() - completedAt < 15 * 60000) return;
   if (!c.calendars || c.calendarComplete) {
-    const list = await googleGet<{
-      items?: { id: string }[];
-      nextPageToken?: string;
-    }>(
-      "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250",
-      token,
-      stopAt,
+    const list = await googleGet<{ items?: { id: string }[]; nextPageToken?: string }>(
+      "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250", token, stopAt,
     );
     c.calendars = list.items || [];
     if (list.nextPageToken)
-      gaps.push(
-        `${email}: calendar list exceeds 250 calendars; remaining calendars not read.`,
-      );
+      gaps.push(`${email}: calendar list exceeds 250 calendars; remaining calendars not read.`);
     c.calendarIndex = 0;
     c.calendarPage = null;
     delete c.calendarQueue;
@@ -234,63 +240,49 @@ async function syncCalendar(
     c.calendarStart = new Date(Date.now() - 90 * 86400000).toISOString();
     c.calendarEnd = new Date(Date.now() + 365 * 86400000).toISOString();
     await storeCursor(email, c);
+    progress(0);
   }
-  const calendar = c.calendars[c.calendarIndex || 0];
-  if (!calendar) {
-    c.calendarComplete = true;
-    await storeCursor(email, c);
-    return;
-  }
-  const q = new URLSearchParams({
-    singleEvents: "true",
-    showDeleted: "true",
-    maxResults: "100",
-    timeMin: c.calendarStart!,
-    timeMax: c.calendarEnd!,
-    ...(c.calendarPage ? { pageToken: c.calendarPage } : {}),
-  });
-  if (!c.calendarQueue) {
-    const page = await googleGet<{
-      items?: CalendarEvent[];
-      nextPageToken?: string;
-    }>(
-      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendar.id)}/events?${q}`,
-      token,
-      stopAt,
-    );
-    c.calendarQueue = page.items || [];
-    c.calendarNext = page.nextPageToken || null;
-    await storeCursor(email, c);
-  }
-  // One durable event turn: do not let per-row calendar writes consume another account's slice.
-  if (c.calendarQueue.length && Date.now() < stopAt) {
-    const e = c.calendarQueue[0];
-    const body = JSON.stringify(e);
-    const url = e.htmlLink?.startsWith("https://calendar.google.com/")
-      ? e.htmlLink
-      : "https://calendar.google.com/calendar/u/0/r";
-    const s = await source(
-      email,
-      "calendar",
-      calendar.id + ":" + e.id,
-      body,
-      url,
-    );
-    if (!s.unchanged) {
-      const facts = validateFacts({ facts: calendarFacts(e) }, body);
-      await saveFacts(s.id, email, url, facts);
+  // Empty calendars and full pages may advance repeatedly within the same frozen phase.
+  for (let page = 0; page < 32 && Date.now() < stopAt; page++) {
+    const calendar = c.calendars[c.calendarIndex || 0];
+    if (!calendar) {
+      if (!c.calendarComplete) {
+        c.calendarComplete = true;
+        c.calendarSyncedAt = new Date().toISOString();
+        await storeCursor(email, c);
+        progress(0);
+      }
+      break;
     }
-    c.calendarQueue.shift();
-    await storeCursor(email, c);
-  }
-  if (!c.calendarQueue.length) {
-    c.calendarPage = c.calendarNext || null;
-    if (!c.calendarNext) c.calendarIndex = (c.calendarIndex || 0) + 1;
-    if ((c.calendarIndex || 0) >= c.calendars.length) c.calendarComplete = true;
+    if (!c.calendarQueue) {
+      const q = new URLSearchParams({
+        singleEvents: "true", showDeleted: "true", maxResults: "100",
+        timeMin: c.calendarStart!, timeMax: c.calendarEnd!,
+        ...(c.calendarPage ? { pageToken: c.calendarPage } : {}),
+      });
+      const result = await googleGet<{items?: CalendarEvent[]; nextPageToken?: string}>(
+        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendar.id)}/events?${q}`, token, stopAt,
+      );
+      c.calendarQueue = result.items || [];
+      c.calendarNext = result.nextPageToken || null;
+      await storeCursor(email, c);
+    }
+    if (Date.now() >= stopAt) break;
+    const next: Cursor = structuredClone(c);
+    next.calendarPage = c.calendarNext || null;
+    if (!c.calendarNext) next.calendarIndex = (c.calendarIndex || 0) + 1;
+    next.calendarComplete = (next.calendarIndex || 0) >= c.calendars.length;
+    if (next.calendarComplete) next.calendarSyncedAt = new Date().toISOString();
+    delete next.calendarQueue;
+    delete next.calendarNext;
+    // Source/item writes and page advancement are one transaction, including old queues.
+    const changed = await saveCalendarPage(email, calendar.id, c.calendarQueue, next);
+    Object.assign(c, next);
     delete c.calendarQueue;
     delete c.calendarNext;
+    progress(changed);
+    if (c.calendarComplete) break;
   }
-  await storeCursor(email, c);
 }
 export async function syncAccount(
   account: Account,
@@ -300,6 +292,8 @@ export async function syncAccount(
 ) {
   const gaps: string[] = [];
   let processed = 0;
+  let calendarProcessed = 0;
+  let madeProgress = false;
   let attempted = 0;
   const email = account.email;
   if (!allowedEmail(email))
@@ -314,22 +308,63 @@ export async function syncAccount(
     if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_MODEL)
       gaps.push(`${email}: model API missing; mail extraction is paused.`);
     else {
-      if (!c.mailQueue?.length) await enqueueMail(email, c, token, mailStopAt);
-      while (c.mailQueue?.length && attempted < budget && Date.now() < mailStopAt) {
-        const extracted = await mailThread(email, c.mailQueue[0], token, gaps, mailStopAt);
-        attempted++;
-        c.mailQueue.shift();
-        if (extracted) processed++;
-        await storeCursor(email, c);
-      }
-      if (!c.mailQueue?.length) {
-        if (c.mailListingDone) c.mailComplete = true;
-        if (c.mailComplete && !c.historyPage && c.historyTarget) {
+      c.mailRetries ||= {};
+      c.mailQueue = [...new Set(c.mailQueue || [])].filter(id => !c.mailRetries![id]);
+      if (c.mailComplete) c.mailListingDone = true; // legacy cursors
+      const attemptedIds = new Set<string>();
+      let pages = 0;
+      let historyFinished = false;
+      // Retry at most two due failures per turn, leaving a fair share for discovery.
+      const dueRetries = Object.keys(c.mailRetries).filter(id => Date.parse(c.mailRetries![id].nextRetryAt) <= Date.now()).slice(0, Math.min(2, budget));
+      while (attempted < Math.min(8, budget) && Date.now() < mailStopAt) {
+        if (!c.mailQueue.length && !historyFinished && pages < 16) {
+          const history = !!c.mailListingDone;
+          const before = JSON.stringify(c);
+          await enqueueMail(email, c, token, mailStopAt);
+          pages++;
+          if (JSON.stringify(c) !== before) madeProgress = true;
+          if (history && !c.historyPage) historyFinished = true;
+        }
+        const fresh: string[] = c.mailQueue.filter(id => !attemptedIds.has(id));
+        // One retry plus one fresh item per concurrent batch; retries never monopolize it.
+        const batch = [dueRetries.shift(), ...fresh].filter((id): id is string => !!id && !attemptedIds.has(id)).slice(0, Math.min(2, budget - attempted, 8 - attempted));
+        if (!batch.length) {
+          if (!historyFinished && pages < 16 && !c.mailQueue.length) continue;
+          break;
+        }
+        batch.forEach(id => attemptedIds.add(id));
+        attempted += batch.length;
+        const results = await Promise.allSettled(batch.map(id => mailThread(email, id, token, gaps, mailStopAt)));
+        for (const [index, result] of results.entries()) {
+          const id = batch[index];
+          c.mailQueue = c.mailQueue.filter(pending => pending !== id);
+          if (result.status === 'fulfilled') {
+            delete c.mailRetries[id];
+            if (result.value) processed++;
+            madeProgress = true;
+          } else {
+            const attempts = (c.mailRetries[id]?.attempts || 0) + 1;
+            c.mailRetries[id] = {
+              attempts,
+              nextRetryAt: new Date(Date.now() + Math.min(3600000, 30000 * 2 ** Math.min(attempts - 1, 7))).toISOString(),
+              reason: safeSyncError(result.reason),
+            };
+          }
+        }
+        // One cursor writer: failed moves and successful removals checkpoint together.
+        c.mailComplete = !!c.mailListingDone && !c.mailQueue.length && !Object.keys(c.mailRetries).length && !c.historyPage;
+        if (!c.mailQueue.length && !c.historyPage && c.historyTarget) {
           c.historyId = c.historyTarget;
           delete c.historyTarget;
         }
         await storeCursor(email, c);
       }
+      c.mailComplete = !!c.mailListingDone && !c.mailQueue.length && !Object.keys(c.mailRetries).length && !c.historyPage;
+      if (!c.mailQueue.length && !c.historyPage && c.historyTarget) {
+        c.historyId = c.historyTarget;
+        delete c.historyTarget;
+      }
+      await storeCursor(email, c);
     }
   } catch (e) {
     if ((e as { status?: number }).status === 404) {
@@ -348,11 +383,13 @@ export async function syncAccount(
   if (Date.now() < stopAt) {
     try {
       await onPhase?.("calendar");
-      await syncCalendar(email, c, token, gaps, stopAt);
-    } catch {
-      gaps.push(`${email}: calendar read failed; saved page will retry.`);
+      await syncCalendar(email, c, token, gaps, stopAt, count => { calendarProcessed += count; madeProgress = true; });
+    } catch (error) {
+      gaps.push(`${email}: calendar read failed; saved page will retry. ${error instanceof Error && error.message.startsWith('Calendar event') ? error.message : ''}`.trim());
     }
   }
+  for (const [id, retry] of Object.entries(c.mailRetries || {}))
+    gaps.push(`${email}: thread ${id} failed; durable retry ${retry.attempts} after ${retry.nextRetryAt}. ${retry.reason}`);
   if (!c.mailComplete)
     gaps.push(`${email}: initial 90-day mail backfill incomplete.`);
   if (!c.calendarComplete)
@@ -368,7 +405,7 @@ export async function syncAccount(
   gaps.push(...attachments);
   await storeCursor(email, c);
   await db()`update accounts set last_sync_at=now(),gap=${gaps.length ? [...new Set(gaps)].join("\n") : null} where email=${email}`;
-  return { processed, gaps: [...new Set(gaps)] };
+  return { processed, calendarProcessed, madeProgress, gaps: [...new Set(gaps)] };
 }
 function safeSyncError(e: unknown) {
   if (e instanceof Error && (['TimeoutError', 'AbortError'].includes(e.name) || e.message.startsWith('Time budget')))
@@ -388,6 +425,8 @@ export async function runSync() {
     };
   const gaps: string[] = [];
   let processed = 0;
+  let calendarProcessed = 0;
+  let madeProgress = false;
   // Leave 20 seconds of the 60-second route for startup, durable writes and cleanup.
   const stopAt = Date.now() + 40000;
   const startedAt = new Date().toISOString();
@@ -395,33 +434,30 @@ export async function runSync() {
   try {
     const previous = await getState<{ lastSyncAt?: string }>("sync");
     const checkpoint = async (phase: string, account: string | null = null) => {
-      await setState("sync", { phase, account, status: "running", startedAt, processed, gaps: [...new Set(gaps)], lastSyncAt: previous?.lastSyncAt || null });
+      await setState("sync", { phase, account, status: "running", startedAt, processed, calendarProcessed, madeProgress, gaps: [...new Set(gaps)], lastSyncAt: previous?.lastSyncAt || null });
     };
     await checkpoint("starting");
     const accounts =
       await db()`select * from accounts order by last_sync_at nulls first,email`;
     if (!accounts.length) gaps.push("No Google accounts connected.");
-    for (const [index, a] of accounts.entries()) {
-      if (Date.now() >= stopAt) {
-        gaps.push("Time budget reached; saved cursors continue on next sync.");
-        break;
-      }
-      try {
-        const r = await syncAccount(
-          a as unknown as Account,
-          1,
-          Math.min(stopAt, Date.now() + Math.min(18000, Math.floor((stopAt - Date.now()) / (accounts.length - index)))),
-          (phase) => checkpoint(phase, a.email),
-        );
-        processed += r.processed;
-        gaps.push(...r.gaps);
-      } catch {
-        const gap = `${a.email}: Google authorization unavailable; reconnect if expired.`;
-        gaps.push(gap);
-        // last_sync_at is the last attempted turn, including failed authorization.
-        // Otherwise a broken null-timestamp account remains at the head forever.
-        await db()`update accounts set last_sync_at=now(),gap=${gap} where email=${a.email}`;
-      }
+    for (let index = 0; index < accounts.length && Date.now() < stopAt; index += 2) {
+      // At most two cursor writers/accounts, each with two mail workers (global cap four).
+      await checkpoint("accounts");
+      const turns = accounts.slice(index, index + 2).map(async a => {
+        try {
+          const r = await syncAccount(a as unknown as Account, 8, stopAt - 4000);
+          processed += r.processed;
+          calendarProcessed += r.calendarProcessed;
+          madeProgress ||= r.madeProgress;
+          gaps.push(...r.gaps);
+        } catch {
+          const gap = `${a.email}: Google authorization unavailable; reconnect if expired.`;
+          gaps.push(gap);
+          await db()`update accounts set last_sync_at=now(),gap=${gap} where email=${a.email}`;
+        }
+      });
+      const settled = await Promise.allSettled(turns);
+      if (settled.some(r => r.status === 'rejected')) throw new Error('Account checkpoint unavailable');
     }
     await checkpoint("news");
     const news = Date.now() < stopAt
@@ -443,6 +479,8 @@ export async function runSync() {
         phase: "finished",
         status: failed ? "failed" : gaps.length ? "partial" : "completed",
         processed,
+        calendarProcessed,
+        madeProgress,
         startedAt,
         gaps: [...new Set(gaps)],
         lastSyncAt: new Date().toISOString(),

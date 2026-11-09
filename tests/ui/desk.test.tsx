@@ -77,7 +77,139 @@ function connected() {
         };
 }
 
+const progress = {
+  accounts: [{email:'owner@example.com',processedThreads:12,pendingThreads:3,failedThreads:1,hasMoreMailPages:true,mailComplete:false,calendarsDone:1,calendarsTotal:2,calendarComplete:false}],
+  totalProcessedThreads:12,totalPendingThreads:3,totalFailedThreads:1,hasMore:true,canContinue:true,madeProgress:true,scopeDays:90,blockedReasons:['One thread waiting for retry.'],
+};
+
 describe("private desk setup", () => {
+  it("runs successive explicit batches at least five seconds apart, shows real counts, and stops on completion", async () => {
+    vi.useFakeTimers(); connected(); const initial = responder; let batches = 0;
+    responder = (url,init) => url === '/api/sync' ? {ok:true,summary:'Batch saved',gaps:[],progress:{...progress,hasMore:++batches < 2}} : initial(url,init);
+    await act(async () => { render(<Desk />); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(requests.filter(r => r.url === '/api/sync')).toHaveLength(0);
+    await act(async () => { fireEvent.click(screen.getByRole('button',{name:'Sync sources'})); });
+    expect(screen.getByText(/12 threads processed/)).toBeInTheDocument();
+    expect(screen.getByText(/3 known pending \(including retries\)/)).toBeInTheDocument();
+    expect(screen.getByText(/1 failed thread/)).toBeInTheDocument();
+    expect(screen.getByText(/1 of 2 calendars/)).toBeInTheDocument();
+    expect(screen.getByText(/90-day/)).toBeInTheDocument();
+    expect(screen.getByText(/browser.*remain open/i)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4999); });
+    expect(batches).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(batches).toBe(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30000); });
+    expect(batches).toBe(2);
+    expect(screen.queryByRole('button',{name:'Pause sync'})).not.toBeInTheDocument();
+  });
+  it("pauses between batches and resumes saved work without bypassing five-second pacing", async () => {
+    vi.useFakeTimers(); connected(); const initial = responder; let batches = 0;
+    responder = (url,init) => url === '/api/sync' ? (++batches,{ok:true,summary:'Saved',gaps:[],progress}) : initial(url,init);
+    await act(async () => { render(<Desk />); });
+    await act(async () => { fireEvent.click(screen.getByRole('button',{name:'Sync sources'})); });
+    fireEvent.click(screen.getByRole('button',{name:'Pause sync'}));
+    expect(screen.getByText(/current batch may finish/i)).toBeInTheDocument();
+    await act(async () => { fireEvent.click(screen.getByRole('button',{name:'Resume sync'})); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4999); });
+    expect(batches).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(batches).toBe(2);
+    fireEvent.click(screen.getByRole('button',{name:'Pause sync'}));
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+    expect(batches).toBe(2);
+  });
+  it("allows an inflight batch to finish after Pause but never overlaps or launches another", async () => {
+    vi.useFakeTimers(); connected(); const initial = responder; let release!: (r:Response)=>void;
+    vi.stubGlobal('fetch',vi.fn(async (url:string,init?:RequestInit) => {
+      requests.push({url,init});
+      if (url === '/api/sync') return new Promise<Response>(resolve => {release=resolve;});
+      return Response.json(initial(url,init));
+    }));
+    await act(async () => { render(<Desk />); });
+    await act(async () => { fireEvent.click(screen.getByRole('button',{name:'Sync sources'})); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect(requests.filter(r=>r.url==='/api/sync')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button',{name:'Pause sync'}));
+    expect(screen.getByRole('button',{name:'Resume sync'})).toBeDisabled();
+    await act(async () => { release(Response.json({ok:true,summary:'Saved',gaps:[],progress})); });
+    expect(screen.getByRole('button',{name:'Resume sync'})).toBeEnabled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+    expect(requests.filter(r=>r.url==='/api/sync')).toHaveLength(1);
+    expect(screen.getByText(/12 threads processed/)).toBeInTheDocument();
+  });
+  it.each([{madeProgress:false,canContinue:true},{madeProgress:true,canContinue:false}])("stops incomplete batches when progress is blocked: %j", async flags => {
+    vi.useFakeTimers(); connected(); const initial=responder; let batches=0;
+    responder=(url,init)=>url==='/api/sync'?(++batches,{ok:true,summary:'Saved',gaps:[],progress:{...progress,...flags}}):initial(url,init);
+    await act(async()=>{render(<Desk />);});
+    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Sync sources'}));});
+    await act(async()=>{await vi.advanceTimersByTimeAsync(60000);});
+    expect(batches).toBe(1);
+    expect(screen.getByText(/no further forward progress/i)).toBeInTheDocument();
+    expect(screen.getByRole('button',{name:'Resume sync'})).toBeEnabled();
+  });
+  it("stops automatic batches when a status refresh reports missing configuration", async () => {
+    vi.useFakeTimers(); connected(); const initial=responder; let batches=0;
+    responder=(url,init)=>url==='/api/sync'?(++batches,{ok:true,summary:'Saved',gaps:[],progress}):url==='/api/status'&&batches ? {...status,authenticated:true,configured:false,gaps:['Database unavailable.']} : initial(url,init);
+    await act(async()=>{render(<Desk />);});
+    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Sync sources'}));});
+    await act(async()=>{await vi.advanceTimersByTimeAsync(30000);});
+    expect(batches).toBe(1);
+  });
+  it("bounds an explicit run to twenty batches", async () => {
+    vi.useFakeTimers(); connected(); const initial=responder; let batches=0;
+    responder=(url,init)=>url==='/api/sync'?(++batches,{ok:true,summary:'Saved',gaps:[],progress}):initial(url,init);
+    await act(async()=>{render(<Desk />);});
+    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Sync sources'}));});
+    await act(async()=>{await vi.advanceTimersByTimeAsync(600000);});
+    expect(batches).toBe(20);
+    expect(screen.getByText(/paused at its safety limit/)).toBeInTheDocument();
+  });
+  it("pauses at ten minutes even if a server batch is still pending", async () => {
+    vi.useFakeTimers(); connected(); const initial=responder; let release!: (r:Response)=>void;
+    vi.stubGlobal('fetch',vi.fn(async(url:string,init?:RequestInit)=>{
+      requests.push({url,init});
+      return url==='/api/sync'?new Promise<Response>(resolve=>{release=resolve;}):Response.json(initial(url,init));
+    }));
+    await act(async()=>{render(<Desk />);});
+    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Sync sources'}));});
+    await act(async()=>{await vi.advanceTimersByTimeAsync(600000);});
+    expect(screen.getByText(/10-minute limit/)).toBeInTheDocument();
+    await act(async()=>{release(Response.json({ok:true,summary:'Saved',gaps:[],progress}));await vi.advanceTimersByTimeAsync(60000);});
+    expect(requests.filter(r=>r.url==='/api/sync')).toHaveLength(1);
+  });
+  it.each([401,403,429,503])("does not automatically retry a sync HTTP %s", async code => {
+    vi.useFakeTimers(); connected(); const initial=responder;
+    vi.stubGlobal('fetch',vi.fn(async(url:string,init?:RequestInit)=>{
+      requests.push({url,init});
+      return url==='/api/sync'?Response.json({error:'Provider or session unavailable'},{status:code}):Response.json(initial(url,init));
+    }));
+    await act(async()=>{render(<Desk />);});
+    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Sync sources'}));});
+    await act(async()=>{await vi.advanceTimersByTimeAsync(600000);});
+    expect(requests.filter(r=>r.url==='/api/sync')).toHaveLength(1);
+    expect(screen.getByRole('alert')).toHaveTextContent('Provider or session unavailable');
+  });
+  it.each(['logout','unmount'])("cancels scheduled POST batches on %s",async action=>{
+    vi.useFakeTimers(); connected(); const initial=responder; let locked=false;
+    responder=(url,init)=>{
+      if(url==='/api/auth/logout'){locked=true;return {ok:true};}
+      if(url==='/api/status'&&locked)return {...status,configured:true,missing:[]};
+      return url==='/api/sync'?{ok:true,summary:'Saved',gaps:[],progress}:initial(url,init);
+    };
+    let unmount!:()=>void;
+    await act(async()=>{({unmount}=render(<Desk />));});
+    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Sync sources'}));});
+    if(action==='logout'){
+      fireEvent.click(screen.getByRole('button',{name:'Settings'}));
+      await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Lock desk'}));});
+    }else unmount();
+    const count=requests.length;
+    await act(async()=>{await vi.advanceTimersByTimeAsync(600000);});
+    expect(requests).toHaveLength(count);
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it("refreshes an active server sync using GET only and unlocks an expired first sync without claiming success", async () => {
     vi.useFakeTimers();
     connected();

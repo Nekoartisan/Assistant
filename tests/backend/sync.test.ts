@@ -4,7 +4,12 @@ import { syncAccount } from "../../lib/sync";
 import { db, saveFacts } from "../../lib/db";
 import { encrypt } from "../../lib/security";
 const enabled = !!process.env.TEST_DATABASE_URL;
-if (enabled) process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+if (enabled) {
+  const target = new URL(process.env.TEST_DATABASE_URL!);
+  if (!['localhost','127.0.0.1','[::1]'].includes(target.hostname) || !target.pathname.includes('test'))
+    throw new Error('Sync tests require a local disposable test database.');
+  process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+}
 afterAll(async () => {
   vi.unstubAllGlobals();
   if (enabled) await db().end();

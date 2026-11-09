@@ -5,7 +5,11 @@ import { claimLease, db, releaseLease } from "../../lib/db";
 import { sign } from "../../lib/security";
 
 const enabled = !!process.env.TEST_DATABASE_URL;
-if (enabled) process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+if (enabled) {
+  const url = new URL(process.env.TEST_DATABASE_URL!);
+  if (!["localhost", "127.0.0.1"].includes(url.hostname) || !url.pathname.endsWith("_test")) throw new Error("Disposable local test database required");
+  process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+}
 beforeAll(async () => {
   process.env.SESSION_SECRET = "s".repeat(40);
   if (enabled) {
@@ -42,6 +46,8 @@ it.skipIf(!enabled)(
     expect(publicStatus).not.toHaveProperty("syncInProgress");
     expect(publicStatus).not.toHaveProperty("syncLeaseExpiresAt");
     expect(publicStatus.accounts).toEqual([]);
+    expect(publicStatus).not.toHaveProperty("progress");
+    expect(active.progress).toMatchObject({scopeDays:90,accounts:expect.any(Array)});
     await db()`update leases set expires_at=now()-interval '1 second' where name='sync'`;
     const expired = await status();
     expect(expired.syncInProgress).toBe(false);
