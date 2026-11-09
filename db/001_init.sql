@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS accounts(email text PRIMARY KEY,refresh_token text NOT NULL,last_sync_at timestamptz,cursor jsonb NOT NULL DEFAULT '{}',gap text);
+CREATE TABLE IF NOT EXISTS sources(id text PRIMARY KEY,account text NOT NULL,kind text NOT NULL,body text NOT NULL,url text NOT NULL,revision text,extracted boolean NOT NULL DEFAULT false,updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS items(id text PRIMARY KEY,source_id text NOT NULL REFERENCES sources(id) ON DELETE CASCADE,fact_key text NOT NULL,data jsonb NOT NULL,manual boolean NOT NULL DEFAULT false,UNIQUE(source_id,fact_key));
+CREATE INDEX IF NOT EXISTS items_status_idx ON items((data->>'status'));
+CREATE TABLE IF NOT EXISTS news(id text PRIMARY KEY,data jsonb NOT NULL,published_at timestamptz NOT NULL,fetched_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS news_published_idx ON news(published_at);
+CREATE TABLE IF NOT EXISTS state(key text PRIMARY KEY,value jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS leases(name text PRIMARY KEY,token text NOT NULL,expires_at timestamptz NOT NULL);
+CREATE TABLE IF NOT EXISTS rate_limits(key text PRIMARY KEY,window_start timestamptz NOT NULL,count integer NOT NULL);
+CREATE TABLE IF NOT EXISTS deliveries(dedupe_key text NOT NULL,channel text NOT NULL,body text NOT NULL,status text NOT NULL DEFAULT 'reserved',created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(dedupe_key,channel));
